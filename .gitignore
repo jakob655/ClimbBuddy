@@ -1,6 +1,9 @@
+# Local toolchains, editor settings, and the project Python environment.
 .pio/
 .vscode/
 .venv/
+
+# Python bytecode and recordings generated while using the dashboard.
 __pycache__/
 *.py[cod]
 dashboard/recordings/

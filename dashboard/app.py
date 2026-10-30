@@ -1,4 +1,8 @@
-"""Local live dashboard: Python + pyserial, HTTP/SSE and browser animation."""
+"""Serve the local dashboard, control acquisition, and stream state over SSE.
+
+All browser tabs share one sensor reader and state pipeline. HTTP request threads
+coordinate control changes through ``Dashboard``; acquisition runs independently.
+"""
 
 import argparse
 from dataclasses import asdict, replace
@@ -16,13 +20,14 @@ from serial_reader import SensorReader, available_ports
 from visualization import render_wall
 
 STATIC = Path(__file__).resolve().parent / 'static'
-STREAM_HZ = 30
+STREAM_HZ = 30  # Browser updates are independent of the 100 Hz sensor sample rate.
 
 
 class Dashboard:
     """One shared sensor per server. Reloads/tabs don't create extra serial readers."""
 
     def __init__(self, *, simulate=True, recordings_dir=RECORDINGS_DIR):
+        # Serialize HTTP actions and payload construction across request threads.
         self.lock = threading.RLock()
         self.state = SensorState()
         self.reader = SensorReader(self.state)
@@ -32,9 +37,11 @@ class Dashboard:
             self.reader.start_simulation()
 
     def close(self):
+        """Release the active source and finish any recording on server shutdown."""
         self.reader.stop()
 
     def begin_stream(self):
+        """Mark a browser as active and revive an idle simulation when needed."""
         with self.lock:
             # A browser opened after the idle timeout should work immediately.
             if self.reader.source == 'Simulation' and not self.reader.connected:
@@ -42,11 +49,20 @@ class Dashboard:
             self.reader.heartbeat()
 
     def ports(self):
+        """Return serial-port metadata suitable for JSON serialization."""
         ports, error = available_ports()
-        return {'ports': [{'device': p.device, 'description': p.description} for p in ports], 'error': error}
+        return {
+            'ports': [
+                {'device': p.device, 'description': p.description} for p in ports
+            ],
+            'error': error,
+        }
 
     def payload(self, generation=None, sequence=0):
+        """Build a JSON-ready snapshot with history newer than the client cursor."""
         with self.lock:
+            # Sequence numbers restart when a source is cleared; a new generation
+            # tells existing tabs to discard their old cursor and receive history.
             cursor = sequence if generation == self.state.generation else 0
             snap = self.state.snapshot(after_sequence=cursor)
             snap['latest'] = asdict(snap['latest']) if snap['latest'] else None
@@ -60,12 +76,14 @@ class Dashboard:
 
     @staticmethod
     def number(value, low, high):
+        """Validate numeric controls before they reach simulation or detection."""
         number = float(value)
         if not math.isfinite(number) or not low <= number <= high:
             raise ValueError(f'Wert muss zwischen {low} und {high} liegen.')
         return number
 
     def action(self, data):
+        """Validate and apply one browser command while excluding other actions."""
         with self.lock:
             action = data.get('action')
             if action == 'source':
@@ -81,7 +99,9 @@ class Dashboard:
                 ports = self.ports()['ports']
                 port = data.get('port')
                 if port not in [item['device'] for item in ports]:
-                    raise ValueError('Port nicht gefunden. USB-Kabel prüfen und Ports aktualisieren.')
+                    raise ValueError(
+                        'Port nicht gefunden. USB-Kabel prüfen und Ports aktualisieren.'
+                    )
                 self.reader.start_serial(port)
                 if not self.reader.connected:
                     raise ValueError(self.reader.error)
@@ -91,10 +111,21 @@ class Dashboard:
                 if self.reader.source != 'Simulation':
                     raise ValueError('Zuerst Simulation auswählen.')
                 values = data.get('values', {})
-                limits = {'roll': (-45, 45), 'pitch': (-45, 45), 'gz': (-150, 150), 'energy': (0, 5)}
+                # Angles are degrees, gz is degrees/second, and energy is m/s².
+                limits = {
+                    'roll': (-45, 45),
+                    'pitch': (-45, 45),
+                    'gz': (-150, 150),
+                    'energy': (0, 5),
+                }
                 if not isinstance(values, dict) or set(values) != set(limits):
                     raise ValueError('Simulation benötigt Roll, Pitch, Gyro Z und Energy.')
-                self.reader.set_simulation(**{key: self.number(values[key], *bounds) for key, bounds in limits.items()})
+                self.reader.set_simulation(
+                    **{
+                        key: self.number(values[key], *bounds)
+                        for key, bounds in limits.items()
+                    }
+                )
             elif action in ('reset', 'simulate_move'):
                 if self.reader.source != 'Simulation':
                     raise ValueError('Zuerst Simulation auswählen.')
@@ -106,9 +137,14 @@ class Dashboard:
                         self.reader.start_simulation()
                     self.reader.simulate_move()
             elif action == 'config':
-                limits = {'energy_threshold': (.1, 5), 'gyro_threshold': (1, 150),
-                          'start_seconds': (.05, 1), 'end_seconds': (.1, 2),
-                          'rotation_threshold': (1, 150), 'lean_threshold': (1, 45)}
+                limits = {
+                    'energy_threshold': (0.1, 5),
+                    'gyro_threshold': (1, 150),
+                    'start_seconds': (0.05, 1),
+                    'end_seconds': (0.1, 2),
+                    'rotation_threshold': (1, 150),
+                    'lean_threshold': (1, 45),
+                }
                 values = data.get('values', {})
                 if not isinstance(values, dict) or not values or not set(values) <= set(limits):
                     raise ValueError('Ungültige Schwellenwerte.')
@@ -127,6 +163,9 @@ class Dashboard:
 
 
 class DashboardServer(ThreadingHTTPServer):
+    """Own the shared controller and signal active streams before closing."""
+
+    # A disconnected or slow browser must not delay process shutdown.
     daemon_threads = True
     block_on_close = False
 
@@ -136,12 +175,15 @@ class DashboardServer(ThreadingHTTPServer):
         super().__init__(address, DashboardHandler)
 
     def server_close(self):
+        """Stop acquisition and let SSE loops observe the shutdown signal."""
         self.stopping.set()
         self.dashboard.close()
         super().server_close()
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    """Serve a small allowlist of local assets, control endpoints, and SSE."""
+
     protocol_version = 'HTTP/1.1'
     disable_nagle_algorithm = True
 
@@ -155,10 +197,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass  # Avoid flooding the terminal with streaming updates.
 
     def local_request(self):
-        allowed = {f'127.0.0.1:{self.server.server_port}', f'localhost:{self.server.server_port}'}
+        """Restrict Host headers to the loopback names served by this instance."""
+        allowed = {
+            f'127.0.0.1:{self.server.server_port}',
+            f'localhost:{self.server.server_port}',
+        }
         return self.headers.get('Host') in allowed
 
     def send_bytes(self, body, content_type, status=200):
+        """Send a finite response with an explicit length and no browser cache."""
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
@@ -168,9 +215,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def json_response(self, value, status=200):
-        self.send_bytes(json.dumps(value, ensure_ascii=False, allow_nan=False).encode(), 'application/json; charset=utf-8', status)
+        """Reject non-finite values rather than emitting invalid JSON numbers."""
+        self.send_bytes(
+            json.dumps(value, ensure_ascii=False, allow_nan=False).encode(),
+            'application/json; charset=utf-8',
+            status,
+        )
 
     def do_GET(self):
+        """Route read requests without exposing arbitrary filesystem paths."""
         if not self.local_request():
             self.json_response({'error': 'Nur lokale Zugriffe erlaubt.'}, 403)
             return
@@ -196,6 +249,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.json_response({'error': 'Nicht gefunden.'}, 404)
 
     def do_POST(self):
+        """Accept bounded JSON commands from the dashboard's local origin."""
         origin = self.headers.get('Origin')
         valid_origin = origin is None or origin == 'http://' + self.headers.get('Host', '')
         if not self.local_request() or not valid_origin:
@@ -219,7 +273,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.json_response({'error': f'Lokaler Ein-/Ausgabefehler: {exc}'}, 500)
 
     def stream(self):
+        """Send incremental state until shutdown, disconnect, or write timeout."""
         controller = self.server.dashboard
+        # Each SSE response occupies one request thread for its whole lifetime.
         if not controller.stream_slots.acquire(blocking=False):
             self.json_response({'error': 'Maximal vier Dashboard-Tabs gleichzeitig.'}, 503)
             return
@@ -239,7 +295,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 controller.reader.heartbeat()
                 payload = controller.payload(generation, sequence)
                 generation, sequence = payload['generation'], payload['total_samples']
-                frame = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+                frame = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(',', ':'),
+                )
                 self.wfile.write(('data: ' + frame + '\n\n').encode())
                 self.wfile.flush()
                 deadline = max(deadline + 1 / STREAM_HZ, time.perf_counter())
@@ -248,16 +309,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (OSError, ConnectionError):
             pass  # Expected when a tab closes or the process is stopped.
         finally:
+            # Every successful acquire must be released, including failed setup.
             controller.stream_slots.release()
             self.close_connection = True
 
     def download_recording(self):
+        """Stream the most recent completed recording using bounded chunks."""
         with self.server.dashboard.state.lock:
             state = self.server.dashboard.state
             path = state.recording_path
             if state.recording_file or not path or not path.is_file():
                 self.json_response({'error': 'Zuerst eine Aufnahme stoppen.'}, 404)
                 return
+            # Open under the state lock so only a completed recording is selected;
+            # release the lock before network writes to avoid blocking ingestion.
             handle = path.open('rb')
         try:
             self.send_response(200)
@@ -274,6 +339,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    """Start the loopback HTTP server and close its resources on interruption."""
     parser = argparse.ArgumentParser(description='BelayBuddy Live-Dashboard')
     parser.add_argument('--port', type=int, default=8501)
     parser.add_argument('--open-browser', action='store_true')
@@ -283,13 +349,17 @@ def main():
         server = DashboardServer(('127.0.0.1', args.port), controller)
     except OSError as exc:
         controller.close()
-        parser.exit(1, f'Port {args.port} nicht verfügbar: {exc}\nBitte Dashboard starten.cmd verwenden oder --port ändern.\n')
+        parser.exit(
+            1,
+            f'Port {args.port} nicht verfügbar: {exc}\n'
+            'Bitte Dashboard starten.cmd verwenden oder --port ändern.\n',
+        )
     url = f'http://127.0.0.1:{server.server_port}'
     print(f'BelayBuddy Live · {url}\nFenster offen lassen. Beenden mit Strg+C.', flush=True)
     if args.open_browser:
         webbrowser.open(url)
     try:
-        server.serve_forever(poll_interval=.2)
+        server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
         pass
     finally:

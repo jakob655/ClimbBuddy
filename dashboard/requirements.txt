@@ -1,1 +1,2 @@
+# Serial-port access; the dashboard otherwise uses the Python standard library.
 pyserial>=3.5,<4

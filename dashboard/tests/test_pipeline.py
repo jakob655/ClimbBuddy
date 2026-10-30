@@ -10,30 +10,55 @@ import time
 import unittest
 from unittest.mock import patch
 
+# Resolve dashboard modules independently of the test runner's working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import serial
 
 from sensor_state import (
-    CSV_COLUMNS, CSVParser, DetectionConfig, GRAVITY_MS2,
-    HISTORY_MAX_SAMPLES, MotionFilter, MotionStatus, MoveDetector,
-    SensorSample, SensorState, apply_deadzones,
+    CSV_COLUMNS,
+    CSVParser,
+    DetectionConfig,
+    GRAVITY_MS2,
+    HISTORY_MAX_SAMPLES,
+    MotionFilter,
+    MotionStatus,
+    MoveDetector,
+    SensorSample,
+    SensorState,
+    apply_deadzones,
 )
 from serial_reader import SensorReader
 from visualization import render_wall
 
 
 def sample(timestamp=0, energy=0.0, gz=0.0, roll=0.0, pitch=0.0):
-    return SensorSample(timestamp, 0.0, 0.0, GRAVITY_MS2 + energy,
-                        0.0, 0.0, gz, roll, pitch, GRAVITY_MS2 + energy,
-                        abs(gz), energy, "MOVING" if energy or gz else "STILL", 100.0)
+    """Build a firmware-shaped sample with explicit motion on the tested axes."""
+    return SensorSample(
+        timestamp,
+        0.0,
+        0.0,
+        GRAVITY_MS2 + energy,
+        0.0,
+        0.0,
+        gz,
+        roll,
+        pitch,
+        GRAVITY_MS2 + energy,
+        abs(gz),
+        energy,
+        "MOVING" if energy or gz else "STILL",
+        100.0,
+    )
 
 
 def csv_line(value):
+    """Serialize in the firmware's canonical field order, without a header."""
     return ",".join(str(asdict(value)[key]) for key in CSV_COLUMNS)
 
 
 def wait_until(predicate, timeout=3):
+    """Wait briefly for background reader work using a monotonic deadline."""
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
         if predicate():
@@ -43,22 +68,35 @@ def wait_until(predicate, timeout=3):
 
 
 class ParserTests(unittest.TestCase):
+    """Validate firmware compatibility and recovery from malformed serial input."""
+
     def test_firmware_contract_and_attach_without_header(self):
-        value = CSVParser().parse("12340,0.030,-0.120,9.780,0.40,-0.20,0.10,-0.70,-0.18,9.781,0.46,0.026,STILL,100.0")
+        value = CSVParser().parse(
+            "12340,0.030,-0.120,9.780,0.40,-0.20,0.10,-0.70,-0.18,9.781,0.46,0.026,STILL,100.0"
+        )
         self.assertEqual(value.timestamp, 12340)
         self.assertAlmostEqual(value.accelerationMagnitude, 9.781)
 
     def test_reordered_header_and_alias(self):
         parser = CSVParser()
         columns = list(reversed(CSV_COLUMNS))
-        parser.parse(",".join("accMagnitude" if c == "accelerationMagnitude" else c for c in columns))
+        parser.parse(
+            ",".join("accMagnitude" if c == "accelerationMagnitude" else c for c in columns)
+        )
         original = sample(20, energy=1.2, gz=-70)
         parsed = parser.parse(",".join(str(asdict(original)[c]) for c in columns))
         self.assertEqual(parsed, original)
 
     def test_invalid_lines_and_nonfinite_values_are_ignored(self):
         parser = CSVParser()
-        for line in ("", "MPU6050 gefunden", "# FEHLER: I2C", "--- IMU ---", "1,2,3", csv_line(sample()) + ",extra"):
+        for line in (
+            "",
+            "MPU6050 gefunden",
+            "# FEHLER: I2C",
+            "--- IMU ---",
+            "1,2,3",
+            csv_line(sample()) + ",extra",
+        ):
             with self.subTest(line=line):
                 self.assertIsNone(parser.parse(line))
         for value in (float("nan"), float("inf"), -float("inf")):
@@ -78,12 +116,15 @@ class ParserTests(unittest.TestCase):
 
 
 class DetectionTests(unittest.TestCase):
+    """Drive movement cycles with a deterministic 100 Hz device and host clock."""
+
     def setUp(self):
         self.detector = MoveDetector(DetectionConfig())
         self.t = 0
         self.completed = []
 
     def feed(self, count, **values):
+        """Advance both clocks by 10 ms per sample and collect completed cycles."""
         for _ in range(count):
             value = sample(self.t, **values)
             move = self.detector.update(value, self.t / 1000)
@@ -118,8 +159,8 @@ class DetectionTests(unittest.TestCase):
 
     def test_hysteresis_requires_both_channels_quiet(self):
         self.feed(30, energy=1)
-        self.feed(100, energy=0.5)  # below start, above rest threshold
-        self.feed(100, gz=15)  # above gyro rest threshold
+        self.feed(100, energy=0.5)  # Below start, above the acceleration rest threshold.
+        self.feed(100, gz=15)  # Above the gyroscope rest threshold.
         self.assertEqual(self.completed, [])
         self.feed(50)
         self.assertEqual(len(self.completed), 1)
@@ -132,29 +173,42 @@ class DetectionTests(unittest.TestCase):
 
 
 class MotionFilterTests(unittest.TestCase):
+    """Check smoothing, angle wrapping, and independence from sampling frequency."""
+
     def test_all_motion_channels_are_smoothed_before_deadzones(self):
         motion_filter = MotionFilter()
         raw = replace(sample(energy=2, gz=60, roll=6, pitch=-6), gx=30, gy=-40)
-        filtered = motion_filter.update(raw, .01)
+        filtered = motion_filter.update(raw, 0.01)
         display = apply_deadzones(filtered)
-        for field in ("roll", "pitch", "gx", "gy", "gz", "gyroMagnitude", "movementEnergy"):
+        for field in (
+            "roll",
+            "pitch",
+            "gx",
+            "gy",
+            "gz",
+            "gyroMagnitude",
+            "movementEnergy",
+        ):
             with self.subTest(field=field):
                 self.assertGreater(abs(getattr(filtered, field)), 0)
                 self.assertLess(abs(getattr(filtered, field)), abs(getattr(raw, field)))
         self.assertEqual((display.roll, display.pitch, display.gx), (0, 0, 0))
         # The deadzone must not erase accumulated low-pass memory.
         for _ in range(100):
-            filtered = motion_filter.update(raw, .01)
+            filtered = motion_filter.update(raw, 0.01)
         self.assertAlmostEqual(filtered.roll, 6, places=4)
         self.assertGreater(apply_deadzones(filtered).roll, 5.9)
         self.assertEqual(raw.roll, 6)
 
     def test_filter_response_depends_on_elapsed_time_not_sample_rate(self):
         results = []
-        for count, dt in ((100, .01), (20, .05), (10, .1)):
+        # Each schedule covers the same second using a different sampling interval.
+        for count, dt in ((100, 0.01), (20, 0.05), (10, 0.1)):
             motion_filter = MotionFilter()
             for _ in range(count):
-                filtered = motion_filter.update(sample(energy=2, gz=60, roll=30, pitch=-20), dt)
+                filtered = motion_filter.update(
+                    sample(energy=2, gz=60, roll=30, pitch=-20), dt
+                )
             results.append(filtered)
         for field in ("roll", "pitch", "gz", "gyroMagnitude", "movementEnergy"):
             self.assertAlmostEqual(getattr(results[0], field), getattr(results[1], field))
@@ -163,18 +217,23 @@ class MotionFilterTests(unittest.TestCase):
     def test_roll_wrap_uses_the_short_arc(self):
         motion_filter = MotionFilter()
         for _ in range(100):
-            motion_filter.update(sample(roll=179), .01)
+            motion_filter.update(sample(roll=179), 0.01)
         for _ in range(25):
-            filtered = motion_filter.update(sample(roll=-179), .01)
+            filtered = motion_filter.update(sample(roll=-179), 0.01)
             self.assertGreater(abs(filtered.roll), 178)
 
 
 class MotionStatusTests(unittest.TestCase):
+    """Verify that interrupted status candidates restart their confirmation timers."""
+
     def test_each_direction_and_activity_requires_continuous_confirmation(self):
         cases = [
-            (sample(roll=-20), "LEFT LEAN"), (sample(roll=20), "RIGHT LEAN"),
-            (sample(pitch=20), "FORWARD LEAN"), (sample(pitch=-20), "BACKWARD LEAN"),
-            (sample(gz=60), "ROTATING LEFT"), (sample(gz=-60), "ROTATING RIGHT"),
+            (sample(roll=-20), "LEFT LEAN"),
+            (sample(roll=20), "RIGHT LEAN"),
+            (sample(pitch=20), "FORWARD LEAN"),
+            (sample(pitch=-20), "BACKWARD LEAN"),
+            (sample(gz=60), "ROTATING LEFT"),
+            (sample(gz=-60), "ROTATING RIGHT"),
             (replace(sample(), gx=60, gyroMagnitude=60), "ROTATING"),
             (sample(energy=2), "MOVING"),
         ]
@@ -182,24 +241,24 @@ class MotionStatusTests(unittest.TestCase):
             with self.subTest(status=expected):
                 status, config = MotionStatus(), DetectionConfig()
                 status.update(active, 0, config)
-                status.update(active, .199, config)
+                status.update(active, 0.199, config)
                 self.assertEqual(status.status, "STILL")
-                status.update(sample(), .2, config)  # breaks the candidate
-                status.update(active, .21, config)
-                status.update(active, .409, config)
+                status.update(sample(), 0.2, config)  # Interrupt the pending candidate.
+                status.update(active, 0.21, config)
+                status.update(active, 0.409, config)
                 self.assertEqual(status.status, "STILL")
-                status.update(active, .41, config)
+                status.update(active, 0.41, config)
                 self.assertEqual(status.status, expected)
 
     def test_still_requires_longer_uninterrupted_quiet(self):
         status, config, active = MotionStatus(), DetectionConfig(), sample(energy=2)
         status.update(active, 0, config)
-        status.update(active, .2, config)
-        status.update(sample(), .3, config)
-        status.update(sample(), .699, config)
+        status.update(active, 0.2, config)
+        status.update(sample(), 0.3, config)
+        status.update(sample(), 0.699, config)
         self.assertEqual(status.status, "MOVING")
-        status.update(active, .7, config)
-        status.update(sample(), .71, config)
+        status.update(active, 0.7, config)
+        status.update(sample(), 0.71, config)
         status.update(sample(), 1.109, config)
         self.assertEqual(status.status, "MOVING")
         status.update(sample(), 1.11, config)
@@ -207,27 +266,45 @@ class MotionStatusTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    """Cover state aggregation, timing discontinuities, bounded history, and recording."""
+
     def test_small_sensor_noise_cannot_move_avatar_or_change_status_or_count_moves(self):
         state = SensorState()
         for i in range(1000):
             direction = 1 if i % 2 else -1
-            state.ingest(sample(i * 10, energy=.08, gz=4 * direction,
-                                roll=2 * direction, pitch=-2 * direction), "test", now=i / 100)
+            state.ingest(
+                sample(
+                    i * 10,
+                    energy=0.08,
+                    gz=4 * direction,
+                    roll=2 * direction,
+                    pitch=-2 * direction,
+                ),
+                "test",
+                now=i / 100,
+            )
             snap = state.snapshot(now=i / 100)
             self.assertEqual(snap["status"], "STILL")
-            self.assertEqual((snap["roll"], snap["pitch"], snap["gz"], snap["yaw"], snap["intensity"]), (0, 0, 0, 0, 0))
+            self.assertEqual(
+                (snap["roll"], snap["pitch"], snap["gz"], snap["yaw"], snap["intensity"]),
+                (0, 0, 0, 0, 0),
+            )
         self.assertEqual(snap["move_count"], 0)
         self.assertEqual(snap["phase"], "REST")
         self.assertEqual(snap["display"]["movementEnergy"], 0)
-        self.assertAlmostEqual(snap["filtered"]["movementEnergy"], .08)
-        self.assertEqual(snap["latest"].movementEnergy, .08)
+        self.assertAlmostEqual(snap["filtered"]["movementEnergy"], 0.08)
+        self.assertEqual(snap["latest"].movementEnergy, 0.08)
         self.assertEqual(snap["history"][-1]["gz"], 0)
 
     def test_isolated_spikes_do_not_create_status_or_move(self):
         state = SensorState()
         for i in range(500):
             spike = i % 100 == 50
-            state.ingest(sample(i * 10, energy=5 if spike else 0, gz=200 if spike else 0), "test", now=i / 100)
+            state.ingest(
+                sample(i * 10, energy=5 if spike else 0, gz=200 if spike else 0),
+                "test",
+                now=i / 100,
+            )
             self.assertEqual(state.snapshot(now=i / 100)["status"], "STILL")
         self.assertEqual(state.snapshot(now=5)["move_count"], 0)
 
@@ -238,7 +315,10 @@ class StateTests(unittest.TestCase):
         self.assertEqual(state.snapshot(now=1)["status"], "ROTATING LEFT")
         state.ingest(sample(4000), "test", now=4)
         snap = state.snapshot(now=4)
-        self.assertEqual((snap["status"], snap["phase"], snap["roll"], snap["gz"], snap["yaw"]), ("STILL", "REST", 0, 0, 0))
+        self.assertEqual(
+            (snap["status"], snap["phase"], snap["roll"], snap["gz"], snap["yaw"]),
+            ("STILL", "REST", 0, 0, 0),
+        )
         self.assertEqual(snap["filtered"]["movementEnergy"], 0)
         state.clear()
         self.assertIsNone(state.snapshot(now=4)["filtered"])
@@ -248,10 +328,14 @@ class StateTests(unittest.TestCase):
     def test_buffers_and_recent_moves_are_bounded(self):
         state = SensorState()
         for i in range(7000):
-            state.ingest(sample(i * 10, energy=2 if i % 100 < 40 else 0), "test", now=i / 100)
+            state.ingest(
+                sample(i * 10, energy=2 if i % 100 < 40 else 0), "test", now=i / 100
+            )
         snap = state.snapshot(now=70)
         self.assertLessEqual(len(snap["history"]), HISTORY_MAX_SAMPLES)
-        self.assertLessEqual(snap["history"][-1]["time_s"] - snap["history"][0]["time_s"], 30.00001)
+        self.assertLessEqual(
+            snap["history"][-1]["time_s"] - snap["history"][0]["time_s"], 30.00001
+        )
         self.assertEqual(len(snap["moves"]), 5)
         self.assertEqual(snap["move_count"], 70)
         self.assertLessEqual(snap["progress"], 100)
@@ -263,7 +347,14 @@ class StateTests(unittest.TestCase):
                 for i in range(50):
                     state.ingest(sample(1000 + i * 10, energy=2), "test", now=i / 100)
                 for i in range(60):
-                    timestamp = i * 10 if gap_kind == "reset" else 4000 + i * 10 if gap_kind == "device_gap" else 1500 + i * 10
+                    # Separate device-clock resets/gaps from host reception gaps.
+                    timestamp = (
+                        i * 10
+                        if gap_kind == "reset"
+                        else 4000 + i * 10
+                        if gap_kind == "device_gap"
+                        else 1500 + i * 10
+                    )
                     now = (3 if gap_kind == "host_gap" else 0.5) + i / 100
                     state.ingest(sample(timestamp), "test", now=now)
                 self.assertEqual(state.snapshot(now=4)["move_count"], 0)
@@ -271,7 +362,11 @@ class StateTests(unittest.TestCase):
     def test_millis_rollover_preserves_a_valid_cycle(self):
         state = SensorState()
         for i in range(120):
-            state.ingest(sample((2**32 - 300 + i * 10) % 2**32, energy=2 if i < 60 else 0), "test", now=i / 100)
+            state.ingest(
+                sample((2**32 - 300 + i * 10) % 2**32, energy=2 if i < 60 else 0),
+                "test",
+                now=i / 100,
+            )
         self.assertEqual(state.snapshot(now=1.2)["move_count"], 1)
 
     def test_smoothing_bounds_and_yaw_decay(self):
@@ -292,8 +387,9 @@ class StateTests(unittest.TestCase):
         state = SensorState()
         with tempfile.TemporaryDirectory() as directory:
             state.start_recording(Path(directory))
+            # Record raw samples even when the display suppresses their small motion.
             for i in range(20):
-                state.ingest(sample(i * 10, energy=.08, gz=4, roll=2), "simulation")
+                state.ingest(sample(i * 10, energy=0.08, gz=4, roll=2), "simulation")
             path = state.snapshot()["recording_path"]
             state.stop_recording()
             with path.open(newline="", encoding="utf-8") as handle:
@@ -304,7 +400,7 @@ class StateTests(unittest.TestCase):
             self.assertEqual(rows[-1]["timestamp"], "190")
             self.assertEqual(float(rows[-1]["roll"]), 2)
             self.assertEqual(float(rows[-1]["gz"]), 4)
-            self.assertEqual(float(rows[-1]["movementEnergy"]), .08)
+            self.assertEqual(float(rows[-1]["movementEnergy"]), 0.08)
             self.assertEqual(state.snapshot()["display"]["gz"], 0)
             state.clear()
             self.assertTrue(path.exists())
@@ -320,6 +416,8 @@ class StateTests(unittest.TestCase):
 
 
 class FakeSerial:
+    """Yield supplied USB chunks, then emulate unplugging the serial connection."""
+
     def __init__(self, chunks):
         self.chunks = iter(chunks)
         self.closed = False
@@ -336,11 +434,25 @@ class FakeSerial:
 
 
 class ReaderTests(unittest.TestCase):
+    """Exercise serial framing, diagnostics, simulation, and reader cleanup."""
+
     def test_fragmented_lines_noise_and_unplug(self):
         state, reader = SensorState(), None
         reader = SensorReader(state)
         first, second = csv_line(sample(10)).encode(), csv_line(sample(20, energy=1)).encode()
-        fake = FakeSerial([b"boot\n", first[:15], b"", first[15:] + b"\n", b"x" * 3000, b"\n", b"\xff\n", second + b"\r\n"])
+        # Include partial frames, an empty read, oversize garbage, and invalid UTF-8.
+        fake = FakeSerial(
+            [
+                b"boot\n",
+                first[:15],
+                b"",
+                first[15:] + b"\n",
+                b"x" * 3000,
+                b"\n",
+                b"\xff\n",
+                second + b"\r\n",
+            ]
+        )
         reader.serial_port, reader.connected = fake, True
         reader._run(False)
         self.assertEqual(state.snapshot()["total_samples"], 2)
@@ -350,7 +462,9 @@ class ReaderTests(unittest.TestCase):
 
     def test_open_failure_does_not_crash(self):
         reader = SensorReader(SensorState())
-        with patch("serial_reader.serial.Serial", side_effect=serial.SerialException("port busy")):
+        with patch(
+            "serial_reader.serial.Serial", side_effect=serial.SerialException("port busy")
+        ):
             reader.start_serial("COM999")
         self.assertFalse(reader.status()["connected"])
         self.assertIn("COM999", reader.status()["error"])
@@ -392,6 +506,7 @@ class ReaderTests(unittest.TestCase):
     def test_idle_client_releases_connection(self):
         state = SensorState()
         reader = SensorReader(state)
+        # Age the last client heartbeat without waiting for the real idle timeout.
         reader.last_client_seen = time.perf_counter() - 31
         reader.connected = True
         fake = FakeSerial([])
@@ -402,13 +517,22 @@ class ReaderTests(unittest.TestCase):
 
 
 class VisualizationTests(unittest.TestCase):
+    """Keep SVG element identities stable for browser-controlled animation."""
+
     def test_wall_exposes_persistent_avatar_parts_for_browser_animation(self):
         import xml.etree.ElementTree as ET
+
         state = SensorState()
         root = ET.fromstring(render_wall(state.snapshot()))
-        for name in ("avatar-position", "avatar-scale", "avatar-lean", "avatar-twist", "wall-progress"):
+        for name in (
+            "avatar-position",
+            "avatar-scale",
+            "avatar-lean",
+            "avatar-twist",
+            "wall-progress",
+        ):
             self.assertEqual(len(root.findall(f".//*[@id='{name}']")), 1)
-        self.assertFalse(root.findall('.//animateTransform'))
+        self.assertFalse(root.findall(".//animateTransform"))
 
 
 if __name__ == "__main__":

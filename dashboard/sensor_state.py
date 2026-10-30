@@ -1,4 +1,9 @@
-"""Shared, thread-safe IMU state. No UI calls and no position integration."""
+"""Parse, filter, classify, record, and snapshot thread-safe IMU session state.
+
+The acquisition worker supplies raw samples. Display signals pass through a
+time-adjusted low-pass filter and deadzones before status and move detection;
+recordings retain the original samples. Avatar progress represents counted moves.
+"""
 
 from collections import deque
 import csv
@@ -10,13 +15,15 @@ import threading
 import time
 
 
-# Central defaults; detection thresholds can also be changed in the sidebar.
+# Acceleration uses m/s², orientation uses degrees, and gyro uses degrees/second.
+# Detection thresholds can also be changed in the sidebar.
 GRAVITY_MS2 = 9.80665
 SAMPLE_HZ = 100
 HISTORY_SECONDS = 30
 CHART_SECONDS = 10
 HISTORY_MAX_SAMPLES = 3200
-# Low-pass alphas at 100 Hz; smaller = calmer/slower. Adjusted for sample dt.
+# Low-pass coefficients at 100 Hz; smaller values respond more slowly.
+# MotionFilter adjusts them for the actual interval between samples.
 ORIENTATION_SMOOTHING_ALPHA = 0.14
 GYRO_SMOOTHING_ALPHA = 0.14
 MOVEMENT_SMOOTHING_ALPHA = 0.10
@@ -36,8 +43,20 @@ VISUAL_STEP_PERCENT = 4
 YAW_LIMIT_DEG = 40.0
 YAW_DECAY_SECONDS = 0.8
 CSV_COLUMNS = (
-    "timestamp", "ax", "ay", "az", "gx", "gy", "gz", "roll", "pitch",
-    "accelerationMagnitude", "gyroMagnitude", "movementEnergy", "state", "sampleHz",
+    "timestamp",
+    "ax",
+    "ay",
+    "az",
+    "gx",
+    "gy",
+    "gz",
+    "roll",
+    "pitch",
+    "accelerationMagnitude",
+    "gyroMagnitude",
+    "movementEnergy",
+    "state",
+    "sampleHz",
 )
 RECORDING_COLUMNS = ("received_at_utc", "source", *CSV_COLUMNS)
 RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
@@ -45,6 +64,8 @@ RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
 
 @dataclass(frozen=True)
 class DetectionConfig:
+    """Immutable thresholds shared by status classification and move detection."""
+
     energy_threshold: float = MOVE_ENERGY_THRESHOLD  # |accelerationMagnitude - g|, m/s²
     gyro_threshold: float = MOVE_GYRO_THRESHOLD  # magnitude, °/s
     start_seconds: float = MOVE_START_CONFIRM_MS / 1000
@@ -56,6 +77,12 @@ class DetectionConfig:
 
 @dataclass(frozen=True)
 class SensorSample:
+    """One firmware CSV row, retaining its wire field names and physical units.
+
+    Acceleration fields and movementEnergy use m/s²; gyro fields use degrees/s;
+    roll/pitch use degrees; sampleHz is the firmware's reported sampling rate.
+    """
+
     timestamp: int  # ESP32 millis(), NOT a Unix timestamp
     ax: float
     ay: float
@@ -79,14 +106,28 @@ class MotionFilter:
         self.reset()
 
     def reset(self):
+        """Reset filter memory to a level sensor resting under gravity."""
         # Start at rest so the first noisy sample cannot become an instant pose.
-        self.values = dict.fromkeys((
-            "roll", "pitch", "gx", "gy", "gz", "gyroMagnitude",
-            "ax", "ay", "az", "accelerationMagnitude", "movementEnergy",
-        ), 0.0)
+        self.values = dict.fromkeys(
+            (
+                "roll",
+                "pitch",
+                "gx",
+                "gy",
+                "gz",
+                "gyroMagnitude",
+                "ax",
+                "ay",
+                "az",
+                "accelerationMagnitude",
+                "movementEnergy",
+            ),
+            0.0,
+        )
         self.values["az"] = self.values["accelerationMagnitude"] = GRAVITY_MS2
 
     def update(self, sample: SensorSample, dt: float) -> SensorSample:
+        """Smooth each channel using its elapsed time in seconds."""
         for field, previous in self.values.items():
             if field in ("roll", "pitch"):
                 base_alpha = ORIENTATION_SMOOTHING_ALPHA
@@ -94,6 +135,7 @@ class MotionFilter:
                 base_alpha = GYRO_SMOOTHING_ALPHA
             else:
                 base_alpha = MOVEMENT_SMOOTHING_ALPHA
+            # Preserve the nominal 100 Hz response when sample intervals vary.
             alpha = 1 - (1 - base_alpha) ** (dt * SAMPLE_HZ)
             difference = getattr(sample, field) - previous
             if field == "roll":
@@ -107,15 +149,21 @@ class MotionFilter:
 def apply_deadzones(sample: SensorSample) -> SensorSample:
     """Leave filter memory intact; only suppress the filtered output."""
     limits = {
-        "roll": ROLL_DEADZONE_DEG, "pitch": PITCH_DEADZONE_DEG,
-        "gx": GYRO_DEADZONE_DPS, "gy": GYRO_DEADZONE_DPS,
-        "gz": GYRO_DEADZONE_DPS, "gyroMagnitude": GYRO_DEADZONE_DPS,
+        "roll": ROLL_DEADZONE_DEG,
+        "pitch": PITCH_DEADZONE_DEG,
+        "gx": GYRO_DEADZONE_DPS,
+        "gy": GYRO_DEADZONE_DPS,
+        "gz": GYRO_DEADZONE_DPS,
+        "gyroMagnitude": GYRO_DEADZONE_DPS,
         "movementEnergy": MOVEMENT_DEADZONE,
     }
-    return replace(sample, **{
-        field: 0.0 if abs(getattr(sample, field)) < limit else getattr(sample, field)
-        for field, limit in limits.items()
-    })
+    return replace(
+        sample,
+        **{
+            field: 0.0 if abs(getattr(sample, field)) < limit else getattr(sample, field)
+            for field, limit in limits.items()
+        },
+    )
 
 
 class MotionStatus:
@@ -125,15 +173,21 @@ class MotionStatus:
         self.reset()
 
     def reset(self):
+        """Discard any pending label transition and return to the rest label."""
         self.status = "STILL"
         self.candidate = self.since = None
 
     def update(self, sample: SensorSample, sample_time: float, config: DetectionConfig):
+        """Debounce the highest-priority matching label on the sample timeline."""
+        # Rotation and movement take precedence over an otherwise static lean.
         if abs(sample.gz) > config.rotation_threshold:
             desired = "ROTATING LEFT" if sample.gz > 0 else "ROTATING RIGHT"
         elif sample.gyroMagnitude > config.rotation_threshold:
             desired = "ROTATING"
-        elif sample.movementEnergy > config.energy_threshold or sample.gyroMagnitude > config.gyro_threshold:
+        elif (
+            sample.movementEnergy > config.energy_threshold
+            or sample.gyroMagnitude > config.gyro_threshold
+        ):
             desired = "MOVING"
         elif abs(sample.roll) > config.lean_threshold:
             desired = "RIGHT LEAN" if sample.roll > 0 else "LEFT LEAN"
@@ -159,6 +213,7 @@ class CSVParser:
         self.columns = CSV_COLUMNS
 
     def parse(self, line: str) -> SensorSample | None:
+        """Return a valid finite sample, or ignore headers and malformed rows."""
         line = line.strip().lstrip("\ufeff")
         if not line or line.startswith("#"):
             return None
@@ -171,7 +226,10 @@ class CSVParser:
             if "timestamp" in normalized:
                 # Reject an invalid header instead of reusing a previous header silently.
                 self.columns = ()
-                if len(normalized) == len(CSV_COLUMNS) and set(normalized) == set(CSV_COLUMNS):
+                if (
+                    len(normalized) == len(CSV_COLUMNS)
+                    and set(normalized) == set(CSV_COLUMNS)
+                ):
                     self.columns = normalized
                 return None
             if not self.columns or len(values) != len(self.columns):
@@ -180,10 +238,22 @@ class CSVParser:
             timestamp = int(row["timestamp"])
             if not 0 <= timestamp <= 0xFFFFFFFF:
                 return None
-            numbers = {key: float(row[key]) for key in CSV_COLUMNS if key not in ("timestamp", "state")}
+            numbers = {
+                key: float(row[key])
+                for key in CSV_COLUMNS
+                if key not in ("timestamp", "state")
+            }
             if not all(math.isfinite(value) for value in numbers.values()):
                 return None
-            if any(numbers[key] < 0 for key in ("accelerationMagnitude", "gyroMagnitude", "movementEnergy", "sampleHz")):
+            if any(
+                numbers[key] < 0
+                for key in (
+                    "accelerationMagnitude",
+                    "gyroMagnitude",
+                    "movementEnergy",
+                    "sampleHz",
+                )
+            ):
                 return None
             state = row["state"].strip().upper()
             if state not in ("STILL", "MOVING", "ROTATING"):
@@ -201,6 +271,7 @@ class MoveDetector:
         self.reset()
 
     def reset(self):
+        """Discard an unfinished move without emitting a completed cycle."""
         # Drop an incomplete cycle on disconnect, clock reset, or a long data gap.
         self.phase = "REST"
         self.candidate = None
@@ -208,26 +279,44 @@ class MoveDetector:
 
     @staticmethod
     def _peaks(move, sample):
+        """Accumulate raw peaks, retaining the sign of the largest absolute lean."""
         move["peak_acceleration"] = max(move["peak_acceleration"], sample.accelerationMagnitude)
         move["peak_gyro"] = max(move["peak_gyro"], sample.gyroMagnitude)
         move["max_roll"] = max(move["max_roll"], sample.roll, key=abs)
         move["max_pitch"] = max(move["max_pitch"], sample.pitch, key=abs)
 
-    def update(self, sample: SensorSample, sample_time: float, *, raw_sample: SensorSample | None = None):
+    def update(
+        self,
+        sample: SensorSample,
+        sample_time: float,
+        *,
+        raw_sample: SensorSample | None = None,
+    ):
+        """Return a move only after confirmed motion followed by confirmed rest."""
         c = self.config
         # Gate using processed signals, but retain source peaks in the move table.
         peaks = raw_sample if raw_sample is not None else sample
-        active = sample.movementEnergy > c.energy_threshold or sample.gyroMagnitude > c.gyro_threshold
-        quiet = sample.movementEnergy < c.energy_threshold * c.rest_ratio and sample.gyroMagnitude < c.gyro_threshold * c.rest_ratio
+        active = (
+            sample.movementEnergy > c.energy_threshold
+            or sample.gyroMagnitude > c.gyro_threshold
+        )
+        # Either channel can start motion; both must settle below lower thresholds
+        # to end it. This hysteresis prevents chatter near the start thresholds.
+        quiet = (
+            sample.movementEnergy < c.energy_threshold * c.rest_ratio
+            and sample.gyroMagnitude < c.gyro_threshold * c.rest_ratio
+        )
         if self.phase == "REST":
             if not active:
                 self.candidate = None
                 return None
             if self.candidate is None:
                 self.candidate = {
-                    "start_time": sample_time, "start_timestamp_ms": sample.timestamp,
+                    "start_time": sample_time,
+                    "start_timestamp_ms": sample.timestamp,
                     "peak_acceleration": peaks.accelerationMagnitude,
-                    "peak_gyro": peaks.gyroMagnitude, "max_roll": peaks.roll,
+                    "peak_gyro": peaks.gyroMagnitude,
+                    "max_roll": peaks.roll,
                     "max_pitch": peaks.pitch,
                 }
             self._peaks(self.candidate, peaks)
@@ -244,6 +333,7 @@ class MoveDetector:
         if sample_time - self.quiet_since[0] + 1e-9 < c.end_seconds:
             return None
         move = dict(self.candidate)
+        # End at the beginning of confirmed rest, excluding its confirmation wait.
         move["end_time"], move["end_timestamp_ms"] = self.quiet_since
         move["duration"] = move["end_time"] - move["start_time"]
         self.reset()
@@ -251,6 +341,12 @@ class MoveDetector:
 
 
 class SensorState:
+    """Own one session's processing pipeline, bounded history, and CSV recording.
+
+    The reentrant lock protects ingestion, snapshots, and control changes. It also
+    allows lifecycle methods to call one another while already holding the lock.
+    """
+
     def __init__(self):
         self.lock = threading.RLock()
         self.config = DetectionConfig()
@@ -280,6 +376,7 @@ class SensorState:
         self.last_flush = 0.0
 
     def configure(self, config: DetectionConfig):
+        """Apply thresholds and discard candidates measured under the old values."""
         with self.lock:
             if config != self.config:
                 self.config = config
@@ -288,11 +385,13 @@ class SensorState:
                 self.motion_status.reset()
 
     def reset_detection(self):
+        """Clear pending moves and status transitions while retaining history."""
         with self.lock:
             self.detector.reset()
             self.motion_status.reset()
 
     def clear(self):
+        """Begin a new source session and invalidate existing browser cursors."""
         with self.lock:
             self.stop_recording()
             self.history.clear()
@@ -310,18 +409,34 @@ class SensorState:
             self.detector.reset()
 
     def ingest(self, sample: SensorSample, source: str, now: float | None = None):
+        """Process one raw sample and optionally record it under the state lock.
+
+        Device timestamps drive filtering and detection; the local monotonic clock
+        measures freshness, arrival rate, recording duration, and delivery gaps.
+        """
         now = time.perf_counter() if now is None else now
         with self.lock:
             dt = 1 / SAMPLE_HZ
             discontinuous = False
             if self.last_timestamp is not None:
                 delta_ms = sample.timestamp - self.last_timestamp
-                if delta_ms < 0 and self.last_timestamp > 0xF0000000 and sample.timestamp < 0x0FFFFFFF:
+                if (
+                    delta_ms < 0
+                    and self.last_timestamp > 0xF0000000
+                    and sample.timestamp < 0x0FFFFFFF
+                ):
                     delta_ms += 2**32  # millis() rollover after ~49.7 days
                 if delta_ms == 0:
+                    # Duplicate timestamps must not advance filters or counters.
                     return
                 dt = delta_ms / 1000
-                if dt <= 0 or dt > MAX_SAMPLE_GAP_SECONDS or now - self.last_received > MAX_SAMPLE_GAP_SECONDS:
+                if (
+                    dt <= 0
+                    or dt > MAX_SAMPLE_GAP_SECONDS
+                    or now - self.last_received > MAX_SAMPLE_GAP_SECONDS
+                ):
+                    # A reset or gap invalidates motion continuity. Resume with a
+                    # fresh filter instead of integrating across missing samples.
                     discontinuous = True
                     self.detector.reset()
                     self.motion_filter.reset()
@@ -347,6 +462,8 @@ class SensorState:
             while self.history and self.history[0]["time_s"] < self.sample_time - HISTORY_SECONDS:
                 self.history.popleft()
 
+            # Bound and decay the visual pose; yaw is a short-lived illustration,
+            # not an absolute heading or an estimate of the climber's position.
             self.display_roll = max(-45, min(45, self.display.roll))
             self.display_pitch = max(-45, min(45, self.display.pitch))
             self.display_gz = self.display.gz
@@ -364,12 +481,19 @@ class SensorState:
             self.visual_progress = min(100, self.move_count * VISUAL_STEP_PERCENT)
             if self.recording_file:
                 try:
-                    self.recording_writer.writerow({
-                        "received_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                        "source": source, **asdict(sample),
-                    })
+                    # Record source values before filtering, with UTC arrival time.
+                    self.recording_writer.writerow(
+                        {
+                            "received_at_utc": datetime.now(timezone.utc).isoformat(
+                                timespec="milliseconds"
+                            ),
+                            "source": source,
+                            **asdict(sample),
+                        }
+                    )
                     self.recorded_samples += 1
                     if now - self.last_flush >= 1:
+                        # Keep disk writes bounded without flushing every sample.
                         self.recording_file.flush()
                         self.last_flush = now
                 except (OSError, ValueError) as exc:
@@ -377,6 +501,7 @@ class SensorState:
                     self.stop_recording()
 
     def start_recording(self, directory: Path = RECORDINGS_DIR):
+        """Create a unique UTF-8 CSV and publish its handle after header success."""
         with self.lock:
             if self.recording_file:
                 return
@@ -403,16 +528,20 @@ class SensorState:
             self.recording_duration = 0.0
 
     def stop_recording(self):
+        """Close and retain the latest recording's path, duration, and counters."""
         with self.lock:
             if self.recording_file:
                 self.recording_duration = time.perf_counter() - self.recording_started
                 try:
                     self.recording_file.close()
                 except OSError as exc:
-                    self.recording_error = f"Recording konnte nicht vollständig gespeichert werden: {exc}"
+                    self.recording_error = (
+                        f"Recording konnte nicht vollständig gespeichert werden: {exc}"
+                    )
                 self.recording_file = self.recording_writer = None
 
     def snapshot(self, now: float | None = None, *, after_sequence: int = 0):
+        """Copy UI state and bounded history rows newer than a sequence cursor."""
         now = time.perf_counter() if now is None else now
         with self.lock:
             fresh = self.latest is not None and now - self.last_received < STALE_SECONDS
@@ -422,20 +551,39 @@ class SensorState:
             rate = (len(arrivals) - 1) / arrival_span if arrival_span > 0 and fresh else 0.0
             intensity = 0.0
             if self.display:
-                intensity = min(1.0, max(self.display.movementEnergy / 5, self.display.gyroMagnitude / 150))
+                intensity = min(
+                    1.0,
+                    max(
+                        self.display.movementEnergy / 5,
+                        self.display.gyroMagnitude / 150,
+                    ),
+                )
             return {
-                "latest": self.latest, "fresh": fresh, "rate": rate,
+                "latest": self.latest,
+                "fresh": fresh,
+                "rate": rate,
                 "filtered": asdict(self.filtered) if self.filtered else None,
                 "display": asdict(self.display) if self.display else None,
                 "status": self.motion_status.status if fresh else "NO DATA",
-                "phase": self.detector.phase, "total_samples": self.total_samples,
-                "move_count": self.move_count, "moves": list(self.moves),
+                "phase": self.detector.phase,
+                "total_samples": self.total_samples,
+                "move_count": self.move_count,
+                "moves": list(self.moves),
                 "history": [row for row in self.history if row["seq"] > after_sequence],
-                "generation": self.generation, "roll": self.display_roll,
-                "pitch": self.display_pitch, "gz": self.display_gz,
-                "yaw": self.yaw_angle, "progress": self.visual_progress,
-                "intensity": intensity, "recording": self.recording_file is not None,
+                "generation": self.generation,
+                "roll": self.display_roll,
+                "pitch": self.display_pitch,
+                "gz": self.display_gz,
+                "yaw": self.yaw_angle,
+                "progress": self.visual_progress,
+                "intensity": intensity,
+                "recording": self.recording_file is not None,
                 "recording_path": self.recording_path,
-                "recording_seconds": now - self.recording_started if self.recording_file else self.recording_duration,
-                "recorded_samples": self.recorded_samples, "recording_error": self.recording_error,
+                "recording_seconds": (
+                    now - self.recording_started
+                    if self.recording_file
+                    else self.recording_duration
+                ),
+                "recorded_samples": self.recorded_samples,
+                "recording_error": self.recording_error,
             }

@@ -1,231 +1,31 @@
-# BelayBuddy – Live Climbing Sensor
+# BelayBuddy dashboard
 
-Lokales Python-/Browser-Dashboard für ESP32-C3 und MPU6050. Die Oberfläche nutzt
-HTML, SVG und Canvas. Python benötigt nur **pyserial**; der HTTP-Server und die
-Datenverarbeitung verwenden die Python-Standardbibliothek.
+The dashboard is a local Python application that displays USB serial data from
+the ESP32-C3 / MPU6050 firmware. A built-in simulation works without hardware.
+The browser draws a persistent SVG avatar and Canvas charts; Python handles
+acquisition, filtering, movement detection, and CSV recording.
 
-## Einfach starten
+Use **Python 3.10 or later**. The only required Python package is `pyserial`; the
+server and sensor pipeline use the standard library. Some interface labels are
+German; this guide uses their visible names. See the
+[main README](../README.md) for wiring and firmware installation.
 
-1. Alte Dashboard-Terminals mit **Strg+C** beenden und alte Browser-Tabs schließen.
-2. Im Windows-Explorer im Projektordner **Dashboard starten.cmd doppelklicken**.
-3. Das Terminal offen lassen. Der Browser öffnet sich automatisch.
-4. **Simulation läuft direkt beim Start.** Oben muss der Samples-Zähler steigen.
+## Start and stop
 
-Der Starter verwendet `.venv`, installiert bei Bedarf pyserial und sucht einen
-freien lokalen Port zwischen 8501 und 8520. Maßgeblich ist die Adresse im neu
-geöffneten Browser/Terminal. Es gibt keine Streamlit-Installation, Fragment-IDs,
-Seiten-Reruns oder automatischen Seiten-Reloads mehr.
+On Windows, double-click **`Dashboard starten.cmd`** in the project root, or run
+this command from that directory:
 
-## Simulation testen
-
-1. **Roll** zwischen −30° und +30° bewegen: Wert und Figur reagieren links/rechts.
-2. **Pitch** bewegen: leichte Größenänderung der Figur.
-3. **Gyro Z** auf +90 °/s: Oberkörper dreht links; −90: rechts. Bei 0 kehrt der
-   rein visuelle Drehwinkel langsam zur Mitte zurück.
-4. **Reset**, danach **Simulate Move** drücken und etwa 2 Sekunden warten:
-   **Detected Moves = 1**, **Demo climbing progress = 4 %**.
-5. **Start Recording**, einige Sekunden bewegen, **Stop Recording**, dann
-   **CSV herunterladen**. Die Datei liegt auch unter `dashboard/recordings/`.
-
-Bei allen Reglern auf 0 bleibt der Avatar ruhig. Samples-Zähler und Charts
-laufen trotzdem weiter. Ein dauerhaft hoher Gyro-/Energy-Wert beendet keinen
-Move: erst ausreichend lange Ruhe bestätigt den Zyklus.
-
-## ESP32 / MPU6050 testen
-
-1. In `src/main.cpp` prüfen:
-
-   ```cpp
-   const TestMode ACTIVE_TEST = IMU_TEST;
-   constexpr bool IMU_CSV_OUTPUT = true;
-   ```
-
-2. ESP32 per USB-Datenkabel anschließen und in PlatformIO **Upload** starten.
-   Auf **SUCCESS** warten. **Build allein überträgt keine Firmware.**
-3. Serial Monitor schließen. Sensor flach/still ablegen, **RESET** drücken,
-   etwa **8 Sekunden** für Start und Kalibrierung warten.
-4. Dashboard öffnen. **Data Source → Serial / ESP32**, **Ports aktualisieren**,
-   passenden COM-Port auswählen und **Connect** drücken.
-5. Auf steigenden Samples-Zähler achten. Sensor kippen und drehen: Avatar und
-   Kurven reagieren. Für einen Move bewegen und danach mindestens 1 s stilllegen.
-6. Vor einem weiteren Upload **Disconnect** drücken.
-
-Die [bestehende Verdrahtungsanleitung](../README.md) gilt weiterhin:
-3V3 → VCC, GND → GND/AD0, GPIO4 → SDA, GPIO5 → SCL. Nach RESET/Upload kann sich
-COM ändern. Fehlt ein Port, USB-Datenkabel und Windows-Gerätemanager prüfen.
-
-**Verbindungsdiagnose · letzte Serial-Zeilen** zeigt Empfangsbytes, Zeilenzähler
-und Originalausgabe. IMU-Textblöcke erfordern CSV-Firmware, `PRESSURE_TEST`
-erfordert `IMU_TEST`. Ein offener COM-Port allein bedeutet noch keinen Datenempfang.
-Firmware- und USB-Fehler werden sichtbar angezeigt. Nach mehr als 2 s ohne
-Samples steht NO DATA; die letzte Pose und Historie bleiben stehen.
-
-## Wie schnell ist die Darstellung?
-
-- **Erfassung:** Ziel etwa 100 Samples/s, in einem eigenen Python-Thread.
-- **Datenübertragung:** kontinuierlicher SSE-Stream mit Ziel 30 Paketen/s.
-  Jedes Paket enthält alle neuen Samples seit dem vorherigen Paket sowie die
-  aktuellste Pose. Es gibt keine anwachsende Warteschlange alter Bildschirmbilder.
-- **Avatar:** `requestAnimationFrame`, üblicherweise etwa 60 Bilder/s, abhängig
-  von Bildschirm, Browser und Rechner. Die Figur interpoliert zwischen neuen
-  Posen. Ihre SVG-Elemente werden einmal erstellt und anschließend direkt bewegt.
-- **Charts:** Canvas, Ziel 30 Zeichnungen/s, letzte 10 s. Nur die Darstellung
-  wird bei Bedarf ausgedünnt; Move-Erkennung und Recording verarbeiten die Samples.
-- **Live-Zahlen:** 10 Aktualisierungen/s, unabhängig von der Avatar-Animation.
-
-Unter den Metriken stehen gemessene Avatar-fps und empfangene Datenpakete/s.
-`Sample Rate · received` ist die tatsächlich in Python empfangene Sensor-Rate.
-`Quelle ... Hz` ist das vom ESP32 gemeldete `sampleHz` (Simulation: Zielrate).
-Browser können Hintergrund-Tabs beim Zeichnen drosseln. Die Python-Erfassung
-läuft über die offene Datenverbindung unabhängig davon weiter.
-
-## Verbindungen, Reload und Recording
-
-Ein Server besitzt genau einen Leser und eine Datenquelle. Mehrere Tabs zeigen
-und bedienen denselben Sensor. Ein Browser-Reload baut nur den Datenstream neu
-auf und setzt weder Moves noch Recording zurück. Bis zu vier Live-Tabs sind
-möglich. Bei Verbindungsabbruch versucht der Browser automatisch neu zu verbinden.
-
-Nach etwa 30 s ohne offene Browser-Datenverbindung gibt der Reader den COM-Port
-frei und beendet Recording. Beim erneuten Öffnen startet eine ruhende Simulation
-automatisch als neue Session; Serial erneut mit **Connect** verbinden. Beenden
-mit Strg+C schließt Reader und Recording ebenfalls.
-
-Recording schreibt fortlaufend auf die Festplatte; der Download wird in kleinen
-Blöcken übertragen. Auch lange Aufzeichnungen werden nicht komplett im RAM gehalten.
-Quellenwechsel, Reset, Disconnect und Serial-Fehler stoppen die Aufnahme. Alte
-CSV-Dateien bleiben erhalten. Dateinamen verwenden lokale Zeit plus Mikrosekunden.
-Die Datei enthält `received_at_utc`, `source` und die Firmware-Spalten.
-
-## CSV und Move-Erkennung
-
-Die bestehende Firmware liefert bei `IMU_CSV_OUTPUT = true`:
-
-```text
-timestamp,ax,ay,az,gx,gy,gz,roll,pitch,accelerationMagnitude,gyroMagnitude,movementEnergy,state,sampleHz
+```powershell
+python dashboard/launch.py
 ```
 
-Timestamp ist `millis()` in ms, Beschleunigung in m/s² einschließlich Schwerkraft,
-Gyro in °/s, Roll/Pitch in Grad. `movementEnergy = abs(accelerationMagnitude -
-9.80665)` ist ein Bewegungsindikator in m/s², keine Energie in Joule. Ein
-verpasster Header ist zulässig; `accMagnitude` wird als Alias akzeptiert.
-Startmeldungen und fehlerhafte/unvollständige Zeilen werden übersprungen.
+The launcher uses the project's `.venv`, creates it if needed, checks `pyserial`,
+and installs requirements if the dependency check fails. Initial setup may need
+internet access. It selects a free port between **8501 and 8520** and opens the
+browser at the printed address. **Simulation starts automatically.** Keep the
+terminal open and press **Ctrl+C** to stop the server.
 
-REST → MOVING → REST zählt einen Move. Standard: Energy > 0,6 m/s² **oder**
-Gyro-Betrag > 20 °/s für mindestens 200 ms; Ende bei beiden Kanälen unter 65 %
-der Startschwelle für mindestens 400 ms. Unter **Move detection · thresholds**
-ändern und **Übernehmen** drücken. Änderungen verwerfen einen offenen Move.
-Die Bedingungen verwenden geglättete Werte nach der Deadzone. Ein dauerhaft
-kleiner Ausschlag oder ein einzelner kurzer Impuls zählt damit keinen Move.
-
-Defaults und Glättung stehen zentral in `sensor_state.py`. Die Tabelle enthält
-die letzten fünf Moves: Start/Ende relativ zur Session, Dauer ohne abschließende
-Ruhe-Bestätigungszeit, Peak acc inklusive g, Peak gyro und maximale Roll-/Pitch-
-Auslenkung mit Vorzeichen. Datenlücken über 1 s oder Zeit-Rücksprünge verwerfen
-offene Moves; `millis()`-Überlauf wird berücksichtigt. Python-Historie maximal
-30 s / 3200 Samples, Browser-Historie maximal 10 s / 3200 Samples.
-
-## Ruhige Darstellung und Filter einstellen
-
-Der Datenpfad ist **RAW → Low-Pass → Deadzone → Anzeige / Status / Move-Erkennung**.
-RAW bezeichnet die im Dashboard empfangenen Werte; bei Serial hat die Firmware
-bereits ihren eigenen Low-Pass angewendet. Dessen Sensorberechnung bleibt erhalten.
-Der zusätzliche Dashboard-Filter glättet Roll/Pitch, alle Gyro-Achsen,
-Gyro-Gesamtbetrag und Movement Energy. Auch Beschleunigungsachsen und -betrag
-werden für Kurven und Anzeige geglättet. Die Filterzeit berücksichtigt die
-tatsächlichen Sample-Abstände; die Alphas beziehen sich auf 100 Hz.
-
-Die Deadzone setzt kleine **gefilterte** Werte exakt auf null, ohne den internen
-Filterwert zu löschen. Statuswechsel wie LEFT/RIGHT LEAN, ROTATING oder MOVING
-benötigen 200 ms durchgehende Bestätigung. Für die Rückkehr zu STILL gelten
-400 ms. Die ungefilterte Firmware-Statusmeldung ist nur noch unter „Quelle“
-sichtbar und kann die beruhigte Hauptanzeige nicht überschreiben.
-
-Die Einstellungen stehen oben in `sensor_state.py`:
-
-| Konstante | Startwert | Wirkung |
-| --- | --- | --- |
-| `ORIENTATION_SMOOTHING_ALPHA` | 0,14 | Low-Pass für Roll und Pitch |
-| `GYRO_SMOOTHING_ALPHA` | 0,14 | Low-Pass für gx, gy, gz und Gyro-Gesamtbetrag |
-| `MOVEMENT_SMOOTHING_ALPHA` | 0,10 | Low-Pass für Movement Energy und Beschleunigung |
-| `ROLL_DEADZONE_DEG` | 3 ° | kleine Roll-Auslenkungen ignorieren |
-| `PITCH_DEADZONE_DEG` | 3 ° | kleine Pitch-Auslenkungen ignorieren |
-| `GYRO_DEADZONE_DPS` | 5 °/s | kleine Gyro-Werte ignorieren |
-| `MOVEMENT_DEADZONE` | 0,12 m/s² | kleine Energy-Werte ignorieren |
-| `STATE_ENTER_MS` | 200 ms | Mindestdauer für einen neuen aktiven Status |
-| `STATE_EXIT_MS` | 400 ms | Mindestdauer vor STILL |
-| `MOVE_GYRO_THRESHOLD` | 20 °/s | Startschwelle für Gyro-Gesamtbetrag |
-| `MOVE_ENERGY_THRESHOLD` | 0,6 m/s² | alternative Startschwelle für Movement Energy |
-| `MOVE_START_CONFIRM_MS` | 200 ms | Bewegung so lange durchgehend bestätigen |
-| `MOVE_END_CONFIRM_MS` | 400 ms | Ruhe so lange durchgehend bestätigen |
-
-Die vier `MOVE_*`-Konstanten liefern die Startwerte der vorhandenen
-**Move detection · thresholds**-Einstellungen. Dort lassen sich Empfindlichkeit
-und Bestätigungszeiten ohne Neustart ändern; Dauerfelder verwenden Sekunden.
-Für das Move-Ende müssen beide Kanäle unter 65 % ihrer Startschwelle liegen.
-Die Deadzones bleiben dabei die Untergrenze der Empfindlichkeit.
-
-In `static/app.js` steuern `AVATAR_POSITION_SMOOTHING = 0.10` und
-`AVATAR_ROTATION_SMOOTHING = 0.08` das zusätzliche weiche Nachziehen.
-Position und Demo-Höhe sowie Körperneigung und Körperdrehung nähern sich ihren
-Zielwerten schrittweise an. Diese Faktoren beziehen sich auf 60 Bilder/s und
-werden an die tatsächlichen Frame-Abstände angepasst.
-
-- **Noch zu nervös:** passende Alphas und Avatar-Faktoren **verkleinern**;
-  Deadzones, Status-Bestätigungszeiten und bei falschen Moves die Move-Schwellen
-  bzw. Start-Bestätigungszeit **erhöhen**.
-- **Zu träge:** passende Alphas und Avatar-Faktoren **erhöhen**;
-  Status-/Move-Bestätigungszeiten **verkürzen**. Wenn kleine echte Bewegungen
-  fehlen, Deadzones bzw. Move-Schwellen **verkleinern**.
-
-Nach Änderungen an Code-Konstanten den Dashboard-Server neu starten und den
-Browser neu laden. Am besten jeweils nur eine Einstellung ändern.
-
-Zum Vergleichen unter den Moves **Filter-Debug · RAW vs. FILTERED** aufklappen:
-
-- **RAW:** empfangener Originalwert.
-- **FILTERED:** zusätzlicher Dashboard-Low-Pass, noch vor der Deadzone.
-- **DISPLAY:** nach Deadzone; Grundlage für Zahlen, Kurven und Erkennung.
-
-Die Tabelle zeigt Roll/Pitch, gx/gy/gz, Gyro-Gesamtbetrag und Movement Energy
-zehnmal pro Sekunde. Winkel und Gyro erscheinen mit einer Nachkommastelle,
-Movement Energy mit zwei. Beispiel: Simulation auf Roll 2°, Gyro Z 4 °/s und
-Energy 0,1 m/s² stellen: RAW/FILTERED zeigen die kleinen Ausschläge, DISPLAY
-bleibt null; Status STILL, keine Moves. Anschließend Roll auf 25° oder
-**Simulate Move** testen: eine echte Bewegung erscheint mit weichem Nachziehen.
-
-CSV-Aufnahmen speichern weiterhin RAW, ebenso die Peak-Werte der Move-Tabelle.
-Reset, Quellenwechsel und Datenlücken verwerfen Filter- und Bestätigungszustände;
-ein normaler Browser-Reload lässt die laufende Session bestehen.
-
-## Grenzen
-
-**Avatar position is a visualization of IMU movement, not measured absolute position.**
-
-Roll verschiebt/neigt die Figur, Pitch ändert leicht die Größe. Gyro Z erzeugt
-einen begrenzten, zur Mitte zurückkehrenden Drehwinkel. Der MPU6050 hat keinen
-Magnetometer und liefert keinen stabilen absoluten Yaw-Winkel. Es gibt keine
-Beschleunigungs-Doppelintegration, metrische Position oder gemessene Höhe.
-**Demo climbing progress** ist Move Count × 4 %, maximal 100 %. Auch Schütteln
-oder Drehen kann einen MVP-Move auslösen. Das ist keine validierte Zugerkennung.
-
-`PRESSURE_TEST`, die vorhandene IMU-Berechnung und PlatformIO-Konfiguration wurden
-für den Wechsel der Oberfläche nicht verändert. Der FSR bleibt separat nutzbar.
-
-## Dateien und manuelle Installation
-
-```text
-dashboard/
-    app.py              HTTP-Server, Aktionen und Live-Datenstream
-    launch.py           Start mit Projektumgebung und freiem Port
-    serial_reader.py    Serial / Simulation, Hintergrundthread, Diagnose
-    sensor_state.py     CSV, Puffer, Glättung, Move Detection, Recording
-    visualization.py    einmaliges SVG-Grundgerüst
-    static/             index.html, style.css, app.js (Animation und Canvas)
-    tests/              Datenpfad- und HTTP/SSE-Integrationstests
-```
-
-Python 3.10 oder neuer (getestet: 3.12). Alternativ zum Windows-Starter:
+For manual installation and a fixed port:
 
 ```powershell
 python -m venv .venv
@@ -233,17 +33,206 @@ python -m venv .venv
 .\.venv\Scripts\python.exe dashboard/app.py --port 8501 --open-browser
 ```
 
-Prüfen, ohne einen Server zu starten:
+On macOS or Linux, replace `.\.venv\Scripts\python.exe` with `.venv/bin/python`.
+The server listens on `127.0.0.1`. Choose another `--port` if needed, or let the
+launcher select one. Close old terminals and tabs if several instances are running.
+
+## Try the simulation
+
+1. Keep **Data Source** set to **Simulation**. Samples and charts should update
+   even when all sliders are at zero.
+2. Adjust **Roll** to lean and move the avatar sideways. **Pitch** slightly
+   changes its scale. **Gyro Z** adds a bounded twist; return the slider to zero
+   to let the avatar turn back toward center.
+3. Adjust **Movement Energy** to change acceleration magnitude relative to gravity.
+4. Click **Reset**, then **Simulate Move**. After roughly two seconds, expect
+   **Detected Moves = 1** and **Demo climbing progress = 4%**.
+5. Click **Start Recording**, generate motion, then **Stop Recording** and
+   **CSV herunterladen**.
+
+`Simulate Move` sends a rest-motion-rest sequence through the same detector as
+serial input. Holding a motion slider high does not complete a move; the detector
+also requires rest. **Reset** returns sliders to zero and starts a new simulation
+session.
+
+## Connect an ESP32
+
+1. Wire the MPU6050 as described in the [main README](../README.md).
+2. Confirm these settings in `src/main.cpp`:
+
+   ```cpp
+   const TestMode ACTIVE_TEST = IMU_TEST;
+   constexpr bool IMU_CSV_OUTPUT = true;
+   ```
+
+3. Build and **upload** the firmware. Building alone does not transfer it.
+4. Close the PlatformIO Serial Monitor. Leave the sensor flat and still, press
+   **RESET**, and allow about eight seconds for startup and calibration.
+5. Select **Data Source > Serial / ESP32**, click **Ports aktualisieren**, choose
+   the correct port, and click **Connect**.
+6. Check that the sample count increases, then tilt or rotate the sensor.
+7. Click **Disconnect** before another upload or opening the Serial Monitor.
+
+One application can own the port at a time. Firmware and reader use **115200 baud**.
+The reader keeps DTR and RTS low when opening the port, matching `platformio.ini`.
+Port names may change after reset or upload; refresh the list if needed.
+
+Expand **Verbindungsdiagnose · letzte Serial-Zeilen** to inspect received bytes,
+line counts, and recent device output. IMU text blocks mean CSV output must be
+enabled; pressure-test lines mean `IMU_TEST` must be selected. An open port alone
+does not imply valid samples. After two seconds without valid data, the dashboard
+shows **NO DATA** and keeps the last pose and history visible.
+
+## Read the display
+
+| Display | Meaning |
+| --- | --- |
+| **Sample Rate · received** | Samples actually received by Python per second |
+| **Quelle ... Hz** | Firmware-reported `sampleHz`, or the simulation target rate |
+| **Current State** | Status after filtering, deadzones, and confirmation |
+| **Detected Moves** | Completed motion-rest cycles in the session |
+| **Acceleration** | Smoothed magnitude, including gravity |
+| **Demo climbing progress** | Move count times 4%, capped at 100% |
+| **Recent Moves** | The last five moves and their peak readings |
+
+Acquisition targets **100 samples/s** in a background Python thread. The server
+sends server-sent events (SSE) at a target **30 packets/s**, including the latest
+pose and newly received history. The avatar uses `requestAnimationFrame`; charts
+target 30 redraws/s and numbers update at 10 Hz. Actual rendering depends on the
+browser, display, and computer. Background tabs may draw less often while Python
+acquisition continues through an open event stream.
+
+Python history is bounded to 30 seconds / 3200 samples; browser history to 10
+seconds / 3200 samples. Charts can skip points for rendering efficiency while
+detection and recording process the acquired samples.
+
+## Movement detection
+
+A completed **REST -> MOVING -> REST** cycle counts as one move. Defaults are:
+
+- Start when **Movement Energy > 0.6 m/s^2** or **gyroscope magnitude > 20 deg/s**
+  persists for at least **200 ms**.
+- Finish when both channels remain below **65% of their start thresholds** for
+  at least **400 ms**.
+
+Open **Move detection · thresholds**, adjust the values, and click **Übernehmen**
+to apply them. Duration fields use seconds.
+Changing settings discards an unfinished move. Brief spikes and continuously held
+motion do not complete a cycle. Deadzones still limit sensitivity if thresholds
+are lowered below them.
+
+Move start/end times are relative to the session. Duration excludes the final
+rest confirmation period. Peak acceleration includes gravity. Maximum roll/pitch
+retain the sign of the greatest absolute excursion. Peaks use raw received
+samples, while movement decisions use filtered values after deadzones. Device
+clock resets or sample gaps over one second discard open moves; normal `millis()`
+rollover is handled.
+
+## Filtering and tuning
+
+```text
+Received sample (RAW) -> low-pass filter (FILTERED) -> deadzone (DISPLAY)
+                                                        |
+                                             display, status, move decisions
+```
+
+With serial input, RAW already includes firmware filtering. The dashboard adds
+smoothing for orientation, gyroscope data, movement energy, and acceleration.
+Filter response accounts for elapsed sample time; alpha constants are referenced
+to 100 Hz. Deadzones suppress small outputs without erasing filter memory.
+
+Defaults are grouped at the top of `sensor_state.py`:
+
+| Constant | Default | Effect |
+| --- | --- | --- |
+| `ORIENTATION_SMOOTHING_ALPHA` | 0.14 | Roll/pitch smoothing |
+| `GYRO_SMOOTHING_ALPHA` | 0.14 | Gyroscope axis and magnitude smoothing |
+| `MOVEMENT_SMOOTHING_ALPHA` | 0.10 | Movement energy and acceleration smoothing |
+| `ROLL_DEADZONE_DEG` / `PITCH_DEADZONE_DEG` | 3 degrees | Ignore small orientation changes |
+| `GYRO_DEADZONE_DPS` | 5 deg/s | Ignore small gyroscope readings |
+| `MOVEMENT_DEADZONE` | 0.12 m/s^2 | Ignore small movement energy |
+| `STATE_ENTER_MS` / `STATE_EXIT_MS` | 200 / 400 ms | Confirm active status / return to `STILL` |
+| `MOVE_GYRO_THRESHOLD` | 20 deg/s | Initial gyroscope move threshold |
+| `MOVE_ENERGY_THRESHOLD` | 0.6 m/s^2 | Initial alternative move threshold |
+| `MOVE_START_CONFIRM_MS` / `MOVE_END_CONFIRM_MS` | 200 / 400 ms | Initial start / rest durations |
+
+The `MOVE_*` constants initialize the movement controls. Directional states, such
+as leaning or rotating left/right, have their own confirmation period. The
+firmware status is displayed separately as source information.
+
+In `static/app.js`, `AVATAR_POSITION_SMOOTHING = 0.10` and
+`AVATAR_ROTATION_SMOOTHING = 0.08` control visual interpolation. Their reference
+rate is 60 frames/s, adjusted to actual frame intervals.
+
+- Too restless: reduce smoothing alphas or avatar factors, increase deadzones or
+  confirmation times, and increase move thresholds if noise causes false moves.
+- Too slow: increase smoothing alphas or avatar factors, or shorten confirmation
+  times. Lower deadzones or thresholds if intended movements are suppressed.
+
+Change one value at a time. Restart the server and reload the browser after
+editing code constants. Expand **Filter-Debug · RAW vs. FILTERED** to compare
+received, smoothed, and displayed signals. For example, simulation values of
+Roll 2 degrees, Gyro Z 4 deg/s, and Energy 0.1 m/s^2 should remain below display
+deadzones: status `STILL`, no moves. Larger movements should respond smoothly.
+
+## Recording and sessions
+
+**Start Recording** writes RAW samples directly to a timestamped CSV under
+`dashboard/recordings/`. Filenames use local time and microseconds. Each row
+contains `received_at_utc`, `source`, and these firmware fields:
+
+```text
+timestamp,ax,ay,az,gx,gy,gz,roll,pitch,accelerationMagnitude,gyroMagnitude,movementEnergy,state,sampleHz
+```
+
+`timestamp` is the device's millisecond counter, not Unix time. Acceleration uses
+m/s^2 and includes gravity; gyro data uses deg/s; roll/pitch use degrees.
+`movementEnergy = abs(accelerationMagnitude - 9.80665)` is a motion indicator in
+m/s^2, not physical energy. The parser accepts a missed header, reordered valid
+headers, and the alias `accMagnitude`. Startup text and malformed samples are
+ignored.
+
+Stop the recording before using **CSV herunterladen**. Downloads stream in small
+blocks, so long recordings are not loaded entirely into memory. Reset, source
+changes, disconnects, and reader shutdown stop recording. Existing files remain.
+
+Each server owns one reader and one shared session. Up to **four live tabs** can
+view and control it. Reloading reconnects the stream without resetting moves or
+recording. The browser retries a lost event stream automatically.
+
+After about **30 seconds without an active browser event stream**, the reader
+releases the serial port and stops recording. Reopening the dashboard resumes an
+idle simulation as a new session. Reconnect serial input using **Connect**.
+Stopping the server with **Ctrl+C** also closes the reader and recording.
+
+## Troubleshooting and checks
+
+| Problem | Action |
+| --- | --- |
+| Launcher fails | Read the terminal message; check Python 3.10+ and package installation |
+| Address in use | Use the launcher or choose a different `--port` for `app.py` |
+| No ports | Check the USB data cable and board connection, then refresh |
+| Port cannot open | Close the Serial Monitor or another program using it |
+| Bytes arrive but no samples | Check serial diagnostics; upload IMU CSV firmware |
+| `NO DATA` | Check firmware errors, USB, calibration, and selected port; reconnect |
+| Move never finishes | Return gyro/energy to rest long enough to confirm it |
+| CSV unavailable | Stop the recording first |
+
+From the project root, verify installation without starting a server and run tests:
 
 ```powershell
 .\.venv\Scripts\python.exe dashboard/launch.py --check
-```
-
-Automatische Tests ohne Hardware:
-
-```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s dashboard/tests -v
 ```
 
-Referenzen: [SSE](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events),
-[requestAnimationFrame](https://developer.mozilla.org/en-US/docs/Web/API/Window/requestAnimationFrame).
+Tests cover malformed data, filtering, movement timing, clock rollover, bounded
+history, recordings, serial failures, and HTTP/SSE integration with simulated input.
+
+## Interpretation limits
+
+**Avatar position is a visualization of IMU movement, not measured absolute position.**
+
+Roll affects lateral position and lean; pitch slightly changes scale; Gyro Z
+produces a bounded twist that returns toward center when rotation stops. There is no double integration,
+measured climbing height, or stable absolute yaw. Shaking or rotating can count as
+a prototype move. The FSR test is separate and uses the Serial Monitor.
