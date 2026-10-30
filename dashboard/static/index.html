@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BelayBuddy – Live Climbing Sensor</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<aside>
+  <a class="brand" href="/">BB<span>BelayBuddy<small>MOVEMENT LAB</small></span></a>
+  <label for="source">Data Source</label>
+  <select id="source"><option value="simulation">Simulation</option><option value="serial">Serial / ESP32</option></select>
+  <div id="serial-controls" hidden>
+    <label for="port">Serial port · 115200 baud</label><select id="port"></select>
+    <button id="refresh-ports" class="wide">Ports aktualisieren</button>
+    <div class="buttons"><button id="connect">Connect</button><button id="disconnect">Disconnect</button></div>
+    <p id="port-hint" class="muted"></p>
+    <p class="muted">Vor Connect den PlatformIO Serial Monitor schließen.</p>
+  </div>
+  <div id="simulation-controls">
+    <label for="sim-roll">Roll <output id="out-roll">0°</output></label>
+    <input id="sim-roll" type="range" min="-45" max="45" value="0" step="1">
+    <label for="sim-pitch">Pitch <output id="out-pitch">0°</output></label>
+    <input id="sim-pitch" type="range" min="-45" max="45" value="0" step="1">
+    <label for="sim-gz">Gyro Z <output id="out-gz">0 °/s</output></label>
+    <input id="sim-gz" type="range" min="-150" max="150" value="0" step="1">
+    <label for="sim-energy">Movement Energy <output id="out-energy">0 m/s²</output></label>
+    <input id="sim-energy" type="range" min="0" max="5" value="0" step="0.1">
+    <div class="buttons"><button id="simulate-move" class="primary">Simulate Move</button><button id="reset">Reset</button></div>
+    <p class="muted">Ein Move ist Bewegung → Ruhe. Bei Reglern auf 0 ruht die Figur.</p>
+  </div>
+  <details><summary>Move detection · thresholds</summary>
+    <form id="thresholds">
+      <label for="energy-threshold">Energy start (m/s²)</label><input id="energy-threshold" name="energy_threshold" type="number" min="0.1" max="5" step="0.1" value="0.6" required>
+      <label for="gyro-threshold">Gyro start (°/s)</label><input id="gyro-threshold" name="gyro_threshold" type="number" min="1" max="150" value="20" required>
+      <label for="start-seconds">Start duration (s)</label><input id="start-seconds" name="start_seconds" type="number" min="0.05" max="1" step="0.05" value="0.20" required>
+      <label for="end-seconds">Rest duration (s)</label><input id="end-seconds" name="end_seconds" type="number" min="0.1" max="2" step="0.05" value="0.4" required>
+      <label for="rotation-threshold">Rotation status (°/s)</label><input id="rotation-threshold" name="rotation_threshold" type="number" min="1" max="150" value="30" required>
+      <label for="lean-threshold">Lean status (°)</label><input id="lean-threshold" name="lean_threshold" type="number" min="1" max="45" value="12" required>
+      <button type="submit" class="wide">Übernehmen</button>
+    </form>
+  </details>
+  <section class="recording"><h2>Recording</h2>
+    <div class="buttons"><button id="record-start">Start Recording</button><button id="record-stop" disabled>Stop Recording</button></div>
+    <p id="record-info" class="muted">0.0 s · 0 Samples</p>
+    <a id="download" class="download" href="/api/recording" hidden>CSV herunterladen</a>
+    <p id="record-path" class="muted"></p>
+  </section>
+  <p class="muted footer">Lokal auf deinem Computer.<br>USB Serial oder Simulation.</p>
+</aside>
+<main>
+  <header><div><p class="eyebrow">BELAYBUDDY · SENSOR LAB</p><h1>Live Climbing Sensor</h1><p class="subtitle">Bewegung sehen. Sensorwerte direkt erleben.</p></div><span id="transport" class="badge">Verbinde …</span></header>
+  <div id="message" class="message" role="status" hidden></div>
+  <div id="connection" class="connection">Datenverbindung wird aufgebaut …</div>
+  <section class="metrics">
+    <div class="metric"><span>Sample Rate · received</span><strong id="sample-rate">—</strong></div>
+    <div class="metric"><span>Current State</span><strong id="state">NO DATA</strong></div>
+    <div class="metric"><span>Detected Moves</span><strong id="move-count">0</strong></div>
+    <div class="metric"><span>Acceleration</span><strong id="acceleration">—</strong></div>
+  </section>
+  <section class="live-layout">
+    <div>{{WALL}}</div>
+    <div class="live-metrics">
+      <p class="eyebrow">CURRENT STATE</p><h2 id="current-state">NO DATA</h2>
+      <div class="detail-grid">
+        <div class="metric"><span>Roll</span><strong id="roll">—</strong></div>
+        <div class="metric"><span>Pitch</span><strong id="pitch">—</strong></div>
+        <div class="metric"><span>Rotation · magnitude</span><strong id="rotation">—</strong></div>
+        <div class="metric"><span>Hip rotation · Gyro Z</span><strong id="gyro-z">—</strong></div>
+      </div>
+      <label for="intensity">Movement intensity <output id="intensity-text">0 %</output></label><progress id="intensity" max="1" value="0"></progress>
+      <p class="muted">Movement Energy: <strong id="movement-energy">—</strong></p>
+      <label for="progress">Demo climbing progress <output id="progress-text">0 %</output></label><progress id="progress" max="100" value="0"></progress>
+      <p class="muted">+4 % pro abgeschlossenem Move. Keine gemessene Höhe.</p>
+      <p id="firmware" class="muted"></p>
+      <p id="performance" class="muted">Kontinuierliche Live-Darstellung</p>
+    </div>
+  </section>
+  <p class="notice">Avatar position is a visualization of IMU movement, not measured absolute position.</p>
+  <section class="charts"><h2>Live sensor data <small>geglättet · letzte 10 Sekunden</small></h2>
+    <div class="chart-grid">
+      <div class="chart-card"><h3>Accelerometer <small>m/s² · inkl. Schwerkraft</small></h3><div class="legend"><i></i>ax <i></i>ay <i></i>az</div><canvas id="accel-chart" role="img" aria-label="Live accelerometer chart"></canvas></div>
+      <div class="chart-card"><h3>Gyroscope <small>°/s</small></h3><div class="legend"><i></i>gx <i></i>gy <i></i>gz</div><canvas id="gyro-chart" role="img" aria-label="Live gyroscope chart"></canvas></div>
+    </div>
+    <div class="chart-card"><h3>Orientation &amp; movement <small>links: Grad · rechts: m/s²</small></h3><div class="legend"><i></i>roll <i></i>pitch <i></i>movementEnergy</div><canvas id="derived-chart" role="img" aria-label="Live roll pitch and movement chart"></canvas></div>
+  </section>
+  <section><h2>Recent Moves</h2><p id="no-moves" class="muted">Noch kein abgeschlossener Move.</p><div class="table-wrap"><table id="moves" hidden><thead><tr><th>Move</th><th>Start (s)</th><th>Ende (s)</th><th>Dauer (s)</th><th>Peak acc (m/s²)</th><th>Peak gyro (°/s)</th><th>Max |roll| (°)</th><th>Max |pitch| (°)</th></tr></thead><tbody id="move-rows"></tbody></table></div></section>
+  <details id="filter-debug"><summary>Filter-Debug · RAW vs. FILTERED</summary>
+    <p class="muted">RAW = empfangene Werte (bei ESP32 bereits durch die Firmware gefiltert). FILTERED = Dashboard-Low-Pass vor Deadzone. DISPLAY = nach Deadzone; verwendet für Anzeige, Status und Move-Erkennung. Recording und Move-Peaks behalten die RAW-Werte.</p>
+    <div class="table-wrap"><table><thead><tr><th>Signal</th><th>RAW</th><th>FILTERED</th><th>DISPLAY</th></tr></thead><tbody>
+      <tr><th>Roll (°)</th><td id="debug-raw-roll">—</td><td id="debug-filtered-roll">—</td><td id="debug-display-roll">—</td></tr>
+      <tr><th>Pitch (°)</th><td id="debug-raw-pitch">—</td><td id="debug-filtered-pitch">—</td><td id="debug-display-pitch">—</td></tr>
+      <tr><th>Gyro X (°/s)</th><td id="debug-raw-gx">—</td><td id="debug-filtered-gx">—</td><td id="debug-display-gx">—</td></tr>
+      <tr><th>Gyro Y (°/s)</th><td id="debug-raw-gy">—</td><td id="debug-filtered-gy">—</td><td id="debug-display-gy">—</td></tr>
+      <tr><th>Gyro Z (°/s)</th><td id="debug-raw-gz">—</td><td id="debug-filtered-gz">—</td><td id="debug-display-gz">—</td></tr>
+      <tr><th>Gyro magnitude (°/s)</th><td id="debug-raw-gyroMagnitude">—</td><td id="debug-filtered-gyroMagnitude">—</td><td id="debug-display-gyroMagnitude">—</td></tr>
+      <tr><th>Movement Energy (m/s²)</th><td id="debug-raw-movementEnergy">—</td><td id="debug-filtered-movementEnergy">—</td><td id="debug-display-movementEnergy">—</td></tr>
+    </tbody></table></div>
+  </details>
+  <details><summary>Verbindungsdiagnose · letzte Serial-Zeilen</summary><p id="diagnosis" class="muted"></p><pre id="serial-lines">Noch keine Serial-Zeile empfangen.</pre></details>
+</main>
+</body></html>

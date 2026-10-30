@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+.venv/
+__pycache__/
+*.py[cod]
+dashboard/recordings/
